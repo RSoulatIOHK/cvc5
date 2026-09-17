@@ -1,0 +1,42 @@
+name: Model parity optional configurations
+on:
+  push:
+    branches: [codex/validate-model-prs]
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.repository == 'RSoulatIOHK/cvc5'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [main, codex/fmf-recursive-aliases, codex/quantifiers-ground-macros]
+        assertions: ['--assertions', '--no-assertions']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.revision }}
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libgmp-dev libgtest-dev
+      - name: Configure
+        run: >-
+          ./configure.sh unrestricted --name=build-validation --ninja
+          --auto-download --unit-testing --gpl --cocoa --glpk --cryptominisat
+          --no-mpfr ${{ matrix.assertions }}
+      - name: Build
+        run: cmake --build build-validation --target cvc5 build-tests -j 4
+      - name: Test
+        env:
+          TEST_TIMEOUT: '60'
+          RUN_REGRESSION_ARGS: --tester base --tester model --tester synth --tester abduct --tester dump
+        run: ctest --test-dir build-validation -j 4 --output-on-failure -LE 'regress[3-4]' | tee validation.log
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ strategy.job-index }}
+          path: |
+            validation.log
+            build-validation/Testing/Temporary/

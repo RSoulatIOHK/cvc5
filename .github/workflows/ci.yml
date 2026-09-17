@@ -1,5 +1,6 @@
 on:
   push:
+    branches-ignore: [codex/validate-model-prs]
   pull_request:
   schedule:
     - cron: '0 5 * * *'
