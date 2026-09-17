@@ -112,14 +112,28 @@ bool TheoryQuantifiers::ppAssert(TrustNode tin,
     bool reqGround =
         options().quantifiers.macrosQuantMode != options::MacrosQuantMode::ALL;
     Node eq = d_qmacros->solve(tin.getProven(), reqGround);
+    TrustNode partialMacro;
+    if (!eq.isNull() && eq.getKind() == Kind::NOT)
+    {
+      partialMacro = d_qmacros->skolemizeMacro(eq, tin);
+      eq = partialMacro.getNode();
+    }
     if (!eq.isNull())
     {
       // must be legal
       if (d_valuation.isLegalElimination(eq[0], eq[1]))
       {
-        // add substitution solved, which ensures we track that eq depends on
-        // tin, which can impact unsat cores.
-        outSubstitutions.addSubstitutionSolved(eq[0], eq[1], tin);
+        if (partialMacro.isNull())
+        {
+          // Preserve the existing justification for full macros.
+          outSubstitutions.addSubstitutionSolved(eq[0], eq[1], tin);
+        }
+        else
+        {
+          // Partial definitions introduce a remainder by skolemization.
+          outSubstitutions.addSubstitution(
+              eq[0], eq[1], partialMacro.getGenerator());
+        }
         return true;
       }
     }

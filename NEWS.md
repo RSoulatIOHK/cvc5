@@ -5,6 +5,10 @@ cvc5 1.4.0 prerelease
 
 ## New Features
 
+- Quantifier macro inference can eliminate definitions restricted to fixed
+  ground arguments, such as `forall x. apply(identity, x) = x`, while preserving
+  unconstrained inputs. Enable with `--macros-quant --macros-quant-mode=all`.
+
 - Added new **abstraction refinement strategy** for abstracting **bit-vector
   arithmetic** operators (`bvmul`, `bvudiv`, `bvurem`), see [Aina Niemetz,
   Mathias Preiner and Yoni Zohar. Scalable Bit-Blasting with Abstractions.
