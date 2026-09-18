@@ -18,6 +18,7 @@
 #include "theory/arith/arith_msum.h"
 #include "theory/quantifiers/ematching/pattern_term_selector.h"
 #include "theory/quantifiers/quantifiers_registry.h"
+#include "theory/quantifiers/skolemize.h"
 #include "theory/quantifiers/term_database.h"
 #include "theory/quantifiers/term_util.h"
 #include "theory/rewriter.h"
@@ -47,7 +48,7 @@ Node QuantifiersMacros::solve(Node lit, bool reqGround)
   if (n.getKind() == Kind::APPLY_UF)
   {
     // predicate case
-    if (isBoundVarApplyUf(n))
+    if (isMacroApplyUf(n))
     {
       Node op = n.getOperator();
       Node n_def = nm->mkConst(pol);
@@ -155,17 +156,23 @@ bool QuantifiersMacros::preservesTriggerVariables(Node q, Node n)
   return trigger_var.size() >= var.size();
 }
 
-bool QuantifiersMacros::isBoundVarApplyUf(Node n)
+bool QuantifiersMacros::isMacroApplyUf(Node n)
 {
   Assert(n.getKind() == Kind::APPLY_UF);
   TypeNode tno = n.getOperator().getType();
   std::map<Node, bool> vars;
-  // allow if a vector of unique variables of the same type as UF arguments
+  // Allow distinct bound variables and independent ground arguments.
   for (size_t i = 0, nchild = n.getNumChildren(); i < nchild; i++)
   {
     if (n[i].getKind() != Kind::BOUND_VARIABLE)
     {
-      return false;
+      // A ground argument restricts the definition to a slice of the
+      // function. solveEq preserves other inputs with a fresh remainder.
+      if (expr::hasBoundVar(n[i]) || containsBadOp(n[i], n.getOperator(), true))
+      {
+        return false;
+      }
+      continue;
     }
     if (n[i].getType() != tno[i])
     {
@@ -192,7 +199,7 @@ void QuantifiersMacros::getMacroCandidates(Node n,
     visited[n] = true;
     if (n.getKind() == Kind::APPLY_UF)
     {
-      if (isBoundVarApplyUf(n))
+      if (isMacroApplyUf(n))
       {
         candidates.push_back(n);
       }
@@ -259,27 +266,67 @@ Node QuantifiersMacros::solveEq(Node n, Node ndef)
   Trace("macros-debug") << "  def: " << ndef << std::endl;
   std::vector<Node> vars;
   std::vector<Node> fvars;
+  std::vector<Node> subs;
+  std::vector<Node> guards;
   for (const Node& nc : n)
   {
-    vars.push_back(nc);
     Node v = NodeManager::mkBoundVar(nc.getType());
     fvars.push_back(v);
+    if (nc.getKind() == Kind::BOUND_VARIABLE)
+    {
+      vars.push_back(nc);
+      subs.push_back(v);
+    }
+    else
+    {
+      guards.push_back(v.eqNode(nc));
+    }
   }
   Node fdef =
-      ndef.substitute(vars.begin(), vars.end(), fvars.begin(), fvars.end());
+      ndef.substitute(vars.begin(), vars.end(), subs.begin(), subs.end());
+  Node remainder;
+  if (!guards.empty())
+  {
+    // This is an equisatisfiable extension: the remainder can match the
+    // original function outside the constrained slice. Never replace the
+    // whole function by a body that only defines one slice.
+    remainder = NodeManager::mkBoundVar(n.getOperator().getType());
+    std::vector<Node> args = {remainder};
+    args.insert(args.end(), fvars.begin(), fvars.end());
+    Node fallback = nm->mkNode(Kind::APPLY_UF, args);
+    fdef = nm->mkNode(Kind::ITE, nm->mkAnd(guards), fdef, fallback);
+  }
   fdef =
       nm->mkNode(Kind::LAMBDA, nm->mkNode(Kind::BOUND_VAR_LIST, fvars), fdef);
   // If the definition has a free variable, it is malformed. This can happen
   // if the right hand side of a macro definition contains a variable not
   // contained in the left hand side
-  if (expr::hasFreeVar(fdef))
+  Node closed = remainder.isNull()
+                    ? fdef
+                    : nm->mkNode(Kind::FORALL,
+                                 nm->mkNode(Kind::BOUND_VAR_LIST, remainder),
+                                 n.getOperator().eqNode(fdef));
+  if (expr::hasFreeVar(closed))
   {
     return Node::null();
   }
   TNode op = n.getOperator();
   TNode fdeft = fdef;
   AssertEqual(op.getType(), fdef.getType());
-  return op.eqNode(fdef);
+  Node eq = op.eqNode(fdef);
+  if (!remainder.isNull())
+  {
+    // The input is equivalent to exists remainder. eq: in the forward
+    // direction the original function witnesses remainder; in the reverse
+    // direction, apply eq to the arguments of the original quantified body.
+    // Use negated forall to match the standard skolemization proof rule.
+    return nm
+        ->mkNode(Kind::FORALL,
+                 nm->mkNode(Kind::BOUND_VAR_LIST, remainder),
+                 eq.notNode())
+        .notNode();
+  }
+  return eq;
 }
 
 Node QuantifiersMacros::returnMacro(Node fdef, Node lit) const
@@ -287,6 +334,39 @@ Node QuantifiersMacros::returnMacro(Node fdef, Node lit) const
   Trace("macros") << "* Inferred macro " << fdef << " from " << lit
                   << std::endl;
   return fdef;
+}
+
+TrustNode QuantifiersMacros::skolemizeMacro(Node definition, TrustNode tin)
+{
+  Assert(definition.getKind() == Kind::NOT);
+  Node q = definition[0];
+  Assert(q.getKind() == Kind::FORALL && q[0].getNumChildren() == 1);
+  Node k = Skolemize::getSkolemConstant(q, 0);
+  Node eq = q[1][0].substitute(TNode(q[0][0]), TNode(k));
+  ProofGenerator* pg = nullptr;
+  if (d_env.isProofProducing() && tin.getGenerator() != nullptr)
+  {
+    if (d_partialProof == nullptr)
+    {
+      d_partialProof.reset(new LazyCDProof(
+          d_env, nullptr, userContext(), "QuantifiersMacros::partial"));
+    }
+    // Only partial definitions need this extension. Full macros retain the
+    // existing addSubstitutionSolved path, including its checked transforms.
+    // The trusted equivalence relates the input to an existential definition;
+    // standard skolemization then justifies choosing the remainder function.
+    Node lit = tin.getProven();
+    Node equiv = lit.eqNode(definition);
+    d_partialProof->addTrustedStep(equiv, TrustId::SUBS_EQ, {}, {});
+    d_partialProof->addLazyStep(lit, tin.getGenerator());
+    d_partialProof->addStep(
+        definition, ProofRule::EQ_RESOLVE, {lit, equiv}, {});
+    Node nn = eq.notNode().notNode();
+    d_partialProof->addStep(nn, ProofRule::SKOLEMIZE, {definition}, {});
+    d_partialProof->addStep(eq, ProofRule::NOT_NOT_ELIM, {nn}, {});
+    pg = d_partialProof.get();
+  }
+  return TrustNode::mkTrustLemma(eq, pg);
 }
 
 }  // namespace quantifiers
